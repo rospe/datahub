@@ -161,6 +161,11 @@ class DatasetUsageStatisticsTransformer(DatasetTransformer, metaclass=ABCMeta):
         return "datasetUsageStatistics"
 
 
+class DatasetUpstreamLineageTransformer(DatasetTransformer, metaclass=ABCMeta):
+    def aspect_name(self) -> str:
+        return "upstreamLineage"
+
+
 class TagsToTermTransformer(TagTransformer, metaclass=ABCMeta):
     def aspect_name(self) -> str:
         return "glossaryTerms"

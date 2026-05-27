@@ -1219,6 +1219,43 @@ transformers:
       replacement: "sub"
 ```
 
+## Pattern Rewrite Upstream Lineage
+
+### Config Details
+
+| Field   | Required | Type       | Default | Description                                                               |
+| ------- | -------- | ---------- | ------- | ------------------------------------------------------------------------- |
+| `rules` | ✅       | list[Rule] |         | Ordered list of regex rewrite rules. Each rule has `match` and `replace`. |
+
+Rewrites upstream dataset URNs in `upstreamLineage` aspects using regex rules. The transformer rewrites:
+
+- coarse-grained upstreams (`upstreamLineage.upstreams[].dataset`)
+- fine-grained upstream field URNs — only the dataset URN embedded inside `urn:li:schemaField:(...)` is rewritten; the field path is left untouched
+
+The downstream entity URN is never modified — only the references to upstream datasets within the lineage aspect are rewritten.
+
+Rules are applied **sequentially** to each upstream URN: the output of rule 1 becomes the input of rule 2, and so on. This lets you compose multiple small rewrites without writing one mega-regex. URNs that don't match any rule pass through unchanged.
+
+If a rule produces a string that doesn't start with `urn:li:`, the rewrite is rejected for that URN, the original URN is kept, and a warning is logged.
+
+This is useful for bridging URN mismatches between sources. For example, when a Snowflake source emits an external S3 upstream URN without a `platform_instance` prefix, but the S3 source was ingested with one, this transformer can rewrite the upstream URN to match — closing the lineage gap.
+
+> **Note:** When two sources emit the same broken upstream URN (e.g. both Snowflake and dbt point to the same external S3 path), apply this transformer to **both** recipes with the same rules. Adding it to only one recipe leaves the other recipe's lineage edges still pointing to the broken URN.
+
+```yaml
+transformers:
+  - type: "pattern_rewrite_upstream_lineage"
+    config:
+      rules:
+        # Rule 1: inject a platform_instance prefix into S3 upstream URNs.
+        - match: 'urn:li:dataset:\(urn:li:dataPlatform:s3,(?!tui_data_lake\.)([^,]+),(\w+)\)'
+          replace: 'urn:li:dataset:(urn:li:dataPlatform:s3,tui_data_lake.\1,\2)'
+        # Rule 2: strip a /legalEntity=... suffix that the S3 source's path_spec
+        # doesn't include in the table path.
+        - match: '(urn:li:dataset:\(urn:li:dataPlatform:s3,[^,]+?)/legalEntity=[^/,]+(,\w+\))'
+          replace: '\1\2'
+```
+
 ## Clean User URN in DatasetUsageStatistics Aspect
 
 ### Config Details
