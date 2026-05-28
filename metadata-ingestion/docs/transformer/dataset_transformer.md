@@ -1242,6 +1242,8 @@ This is useful for bridging URN mismatches between sources. For example, when a 
 
 > **Note:** When two sources emit the same broken upstream URN (e.g. both Snowflake and dbt point to the same external S3 path), apply this transformer to **both** recipes with the same rules. Adding it to only one recipe leaves the other recipe's lineage edges still pointing to the broken URN.
 
+> **Incremental lineage support:** Sources that enable `incremental_lineage` (e.g. Snowflake, BigQuery) emit `upstreamLineage` as JSON-patch MCPs rather than full aspects. This transformer handles both shapes — UPSERT aspects and PATCH operations — so the rewrite applies in either mode.
+
 ```yaml
 transformers:
   - type: "pattern_rewrite_upstream_lineage"
