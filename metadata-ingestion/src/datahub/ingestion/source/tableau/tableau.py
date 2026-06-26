@@ -279,6 +279,21 @@ class TableauConnectionConfig(ConfigModel):
         description="Configures the trust_env property in the requests session. If set to false (default value) it will bypass proxy settings. See https://requests.readthedocs.io/en/latest/api/#requests.Session.trust_env for more information.",
     )
 
+    metadata_query_timeout: int = Field(
+        default=180,
+        description="Total wall-clock timeout in seconds for a single Metadata API GraphQL request. "
+        "Unlike the per-socket-read timeout, this is a hard deadline. If Tableau holds the "
+        "connection open without completing the response (e.g. stuck server-side query), "
+        "the request is aborted and retried. Set higher for very large sites.",
+    )
+
+    sql_parsing_timeout: int = Field(
+        default=120,
+        description="Timeout in seconds for SQL parsing of Custom SQL queries. "
+        "Complex queries (e.g. Snowflake LATERAL FLATTEN, DB2 dialect) can cause "
+        "sqlglot to hang indefinitely. On timeout, lineage for that query is skipped.",
+    )
+
     extract_column_level_lineage: bool = Field(
         True,
         description="When enabled, extracts column-level lineage from Tableau Datasources",
@@ -1579,6 +1594,7 @@ class TableauSiteSource:
                 first=fetch_size,
                 after=current_cursor,
                 qry_filter=query_filter,
+                total_timeout_seconds=self.config.metadata_query_timeout,
             )
 
         except REAUTHENTICATE_ERRORS as e:
@@ -2762,6 +2778,59 @@ class TableauSiteSource:
         cleaned = re.sub(r"@+\w+", "1", cleaned)
         return cleaned.replace("<<", "<").replace(">>", ">").replace("\n\n", "\n")
 
+    def _parse_sql_with_timeout(
+        self,
+        query: str,
+        default_db: Optional[str],
+        platform: str,
+        platform_instance: Optional[str],
+        env: str,
+        datasource_urn: str,
+    ) -> Optional[SqlParsingResult]:
+        """Wrap SQL parsing in a timeout to prevent hangs on pathological queries.
+
+        Complex queries (e.g. Snowflake LATERAL FLATTEN, DB2 dialect) can cause
+        sqlglot to hang indefinitely. This method runs parsing in a separate thread
+        with a configurable timeout (default 120s). On timeout, the query is skipped.
+        """
+        from concurrent.futures import (
+            ThreadPoolExecutor as _TPE,
+            TimeoutError as _FuturesTimeoutError,
+        )
+
+        timeout = self.config.sql_parsing_timeout
+
+        def _do_parse() -> SqlParsingResult:
+            return create_lineage_sql_parsed_result(
+                query=query,
+                default_db=default_db,
+                platform=platform,
+                platform_instance=platform_instance,
+                env=env,
+                graph=self.ctx.graph,
+                schema_aware=not self.config.sql_parsing_disable_schema_awareness,
+            )
+
+        try:
+            executor = _TPE(max_workers=1)
+            future = executor.submit(_do_parse)
+            try:
+                return future.result(timeout=timeout)
+            except _FuturesTimeoutError:
+                logger.warning(
+                    f"SQL parsing timed out after {timeout}s for datasource "
+                    f"{datasource_urn}. Skipping lineage for this query. "
+                    f"Query (first 200 chars): {query[:200]!r}"
+                )
+                self.report.num_upstream_table_lineage_failed_parse_sql += 1
+                return None
+            finally:
+                executor.shutdown(wait=False)
+        except Exception as e:
+            logger.warning(f"SQL parsing failed for datasource {datasource_urn}: {e}")
+            self.report.num_upstream_table_lineage_failed_parse_sql += 1
+            return None
+
     def parse_custom_sql(
         self,
         datasource: dict,
@@ -2832,15 +2901,16 @@ class TableauSiteSource:
             f"Overridden info upstream_db={upstream_db}, platform_instance={platform_instance}, platform={platform}"
         )
 
-        parsed_result = create_lineage_sql_parsed_result(
+        parsed_result = self._parse_sql_with_timeout(
             query=query,
             default_db=upstream_db,
             platform=platform,
             platform_instance=platform_instance,
             env=env,
-            graph=self.ctx.graph,
-            schema_aware=not self.config.sql_parsing_disable_schema_awareness,
+            datasource_urn=datasource_urn,
         )
+        if parsed_result is None:
+            return None
 
         assert parsed_result is not None
 
