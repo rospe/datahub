@@ -125,6 +125,9 @@ from datahub.ingestion.source.tableau.tableau_common import (
     tableau_field_to_schema_field,
     workbook_graphql_query,
 )
+from datahub.ingestion.source.tableau.tableau_embedded_luid import (
+    fetch_embedded_datasource_luids,
+)
 from datahub.ingestion.source.tableau.tableau_initial_sql import (
     InitialSqlConnection,
     extract_definition_bytes,
@@ -1262,6 +1265,9 @@ class TableauSiteSource:
 
         # Flag set by get_connection_object_page to signal node limit hit
         self._last_response_hit_node_limit: bool = False
+
+        # Lookup map: embedded datasource name -> LUID (fetched from Admin Insights)
+        self._embedded_datasource_luid_map: Dict[str, str] = {}
 
         report_user_role(report=report, server=server)
 
@@ -4434,6 +4440,13 @@ class TableauSiteSource:
                 field_upstream_query=datasource_upstream_fields_graphql_query,
                 page_size=self.config.effective_embedded_datasource_field_upstream_page_size,
             )
+
+            # Enrich embedded datasource with LUID from Admin Insights if available
+            if self._embedded_datasource_luid_map:
+                ds_name = datasource.get(c.NAME)
+                if ds_name and ds_name in self._embedded_datasource_luid_map:
+                    datasource[c.LUID] = self._embedded_datasource_luid_map[ds_name]
+
             yield from self.emit_datasource(
                 datasource,
                 datasource.get(c.WORKBOOK),
@@ -4841,6 +4854,26 @@ class TableauSiteSource:
 
             # STEP 1: Emit datasources first (VC references get collected during this step)
             if self.embedded_datasource_ids_being_used:
+                # Fetch embedded datasource LUIDs from Admin Insights before emission.
+                # This enriches embedded datasource entities with their LUID, which is
+                # not available via the Tableau Metadata API.
+                # Gracefully skipped if the user lacks permissions or VDS is unavailable.
+                try:
+                    self._embedded_datasource_luid_map = (
+                        fetch_embedded_datasource_luids(server=self.server)
+                    )
+                    if self._embedded_datasource_luid_map:
+                        logger.info(
+                            f"Fetched {len(self._embedded_datasource_luid_map)} "
+                            f"embedded datasource LUIDs from Admin Insights"
+                        )
+                except Exception as e:
+                    logger.debug(
+                        f"Could not fetch embedded datasource LUIDs from "
+                        f"Admin Insights (enrichment will be skipped): {e}"
+                    )
+                    self._embedded_datasource_luid_map = {}
+
                 with PerfTimer() as timer:
                     yield from self.emit_embedded_datasources()
                     self.report.emit_embedded_datasources_timer[
