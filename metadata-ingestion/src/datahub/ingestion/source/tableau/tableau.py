@@ -132,6 +132,9 @@ from datahub.ingestion.source.tableau.tableau_initial_sql import (
     extract_initial_sql_connections,
     extract_tds_bytes,
 )
+from datahub.ingestion.source.tableau.tableau_resilience import (
+    AdaptivePageSizeCircuitBreaker,
+)
 from datahub.ingestion.source.tableau.tableau_server_wrapper import UserInfo
 from datahub.ingestion.source.tableau.tableau_validation import check_user_role
 from datahub.ingestion.source.tableau.tableau_virtual_connections import (
@@ -1252,6 +1255,14 @@ class TableauSiteSource:
         # when emitting custom SQL data sources.
         self.custom_sql_ids_being_used: List[str] = []
 
+        # Adaptive page size circuit breaker — shared across all connection types
+        self._page_size_circuit_breaker = AdaptivePageSizeCircuitBreaker(
+            min_page_size=1
+        )
+
+        # Flag set by get_connection_object_page to signal node limit hit
+        self._last_response_hit_node_limit: bool = False
+
         report_user_role(report=report, server=server)
 
     @property
@@ -1703,6 +1714,9 @@ class TableauSiteSource:
             self.config.max_retries if retries_remaining is None else retries_remaining
         )
 
+        # Reset node limit flag for this request
+        self._last_response_hit_node_limit = False
+
         logger.debug(
             f"Query {connection_type} to get {fetch_size} objects with cursor {current_cursor}"
             f" and filter {query_filter}"
@@ -1868,6 +1882,11 @@ class TableauSiteSource:
                     if (e.get(c.EXTENSIONS) or {}).get("classification")
                     == "NullValueInNonNullableField"
                 ]
+
+                # Track node limit for the adaptive page size circuit breaker
+                if node_limit_errors:
+                    self._last_response_hit_node_limit = True
+
                 if null_field_errors and node_limit_errors:
                     recovery_result = self._handle_node_limit_with_null_fields(
                         query=query,
@@ -1976,12 +1995,17 @@ class TableauSiteSource:
 
         # Calls the get_connection_object_page function to get the objects,
         # and automatically handles pagination.
+        # The circuit breaker adapts fetch_size dynamically based on NODE_LIMIT_EXCEEDED
+        # responses — starting at the configured page_size, dropping on failures, and
+        # recovering after sustained success.
 
         filter_pages = get_filter_pages(query_filter, page_size)
         self.report.num_queries_by_connection_type[connection_type] += 1
         self.report.num_filter_queries_by_connection_type[connection_type] += len(
             filter_pages
         )
+
+        cb = self._page_size_circuit_breaker
 
         for filter_page in filter_pages:
             has_next_page = 1
@@ -1994,6 +2018,10 @@ class TableauSiteSource:
                 ] += 1
 
                 self.report.num_expected_tableau_metadata_queries += 1
+
+                # Circuit breaker determines the effective fetch size
+                effective_fetch_size = cb.get_page_size(connection_type, page_size)
+
                 (
                     connection_objects,
                     current_cursor,
@@ -2003,12 +2031,14 @@ class TableauSiteSource:
                     connection_type=connection_type,
                     query_filter=filter_,
                     current_cursor=current_cursor,
-                    # `filter_page` contains metadata object IDs (e.g., Project IDs, Field IDs, Sheet IDs, etc.).
-                    # The number of IDs is always less than or equal to page_size.
-                    # If the IDs are primary keys, the number of metadata objects to load matches the number of records to return.
-                    # In our case, mostly, the IDs are primary key, therefore, fetch_size is set equal to page_size.
-                    fetch_size=page_size,
+                    fetch_size=effective_fetch_size,
                 )
+
+                # Update circuit breaker state based on response
+                if self._last_response_hit_node_limit:
+                    cb.on_node_limit(connection_type)
+                else:
+                    cb.on_success(connection_type)
 
                 yield from connection_objects.get(c.NODES) or []
 
