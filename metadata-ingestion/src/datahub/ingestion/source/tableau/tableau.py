@@ -1555,7 +1555,130 @@ class TableauSiteSource:
             or not self._is_hidden_view(dashboard)
         )
 
-    def get_connection_object_page(
+    def _handle_node_limit_with_null_fields(
+        self,
+        query: str,
+        connection_type: str,
+        query_filter: str,
+        query_data: dict,
+        fetch_size: int,
+        current_cursor: Optional[str],
+        retry_on_auth_error: bool,
+        retries_remaining: int,
+        null_field_errors: List[dict],
+    ) -> Optional[Tuple[dict, Optional[str], int]]:
+        """Handle node limit + null field errors by retrying at page size 1 or splitting the query.
+
+        Returns a tuple (connection_object, next_cursor, has_next_page) on successful recovery,
+        or None if recovery failed and the caller should fall through to use partial data.
+        """
+        if fetch_size > 1:
+            logger.warning(
+                f"Node limit caused null fields in {connection_type} "
+                f"(page size {fetch_size}). Retrying with page size 1. "
+                f"Affected paths: {[e.get('path') for e in null_field_errors]}"
+            )
+            return self.get_connection_object_page(
+                query=query,
+                connection_type=connection_type,
+                query_filter=query_filter,
+                fetch_size=1,
+                current_cursor=current_cursor,
+                retry_on_auth_error=retry_on_auth_error,
+                retries_remaining=retries_remaining,
+            )
+
+        # Page size 1 still hits the limit — split into per-branch sub-queries.
+        logger.warning(
+            f"Node limit hit at page size 1 for {connection_type}. "
+            f"Splitting query into branches to fetch complete data."
+        )
+        merged = self._fetch_entity_by_split_query(
+            query=query,
+            connection_type=connection_type,
+            query_filter=query_filter,
+            current_cursor=current_cursor,
+        )
+        if merged is not None:
+            connection_object = {
+                c.NODES: [merged],
+                c.PAGE_INFO: query_data.get(c.DATA, {})
+                .get(connection_type, {})
+                .get(c.PAGE_INFO, {}),
+            }
+            has_next_page = connection_object.get(c.PAGE_INFO, {}).get(
+                c.HAS_NEXT_PAGE, False
+            )
+            next_cursor = connection_object.get(c.PAGE_INFO, {}).get("endCursor", None)
+            return connection_object, next_cursor, has_next_page
+
+        logger.warning(
+            f"Split query also failed for {connection_type}. "
+            f"Using partial results from original response."
+        )
+        return None
+
+    def _fetch_entity_by_split_query(
+        self,
+        query: str,
+        connection_type: str,
+        query_filter: str,
+        current_cursor: Optional[str],
+    ) -> Optional[dict]:
+        """Split a GraphQL query into per-branch sub-queries when a single entity exceeds the node limit.
+
+        The main query requests all nested objects (fields, workbook, upstreamTables, etc.) at once.
+        When a single entity is so large that even page_size=1 exceeds the 20k node limit, we fetch
+        each branch separately and merge them into one complete entity dict.
+        """
+        # Known heavy branches that are worth splitting out
+        heavy_branches = [
+            "fields",
+            "workbook",
+            "upstreamTables",
+            "upstreamDatasources",
+            "downstreamSheets",
+        ]
+
+        merged: dict = {}
+
+        for branch in heavy_branches:
+            # Build a minimal query that only fetches scalar fields + this one branch
+            sub_query = f"""
+            {{
+                __typename
+                id
+                name
+                luid
+                {branch} {{ __typename id name }}
+            }}
+            """
+            try:
+                query_data = query_metadata_cursor_based_pagination(
+                    server=self.server,
+                    main_query=sub_query,
+                    connection_name=connection_type,
+                    first=1,
+                    after=current_cursor,
+                    qry_filter=query_filter,
+                    total_timeout_seconds=self.config.metadata_query_timeout,
+                )
+                nodes = (
+                    query_data.get(c.DATA, {}).get(connection_type, {}).get(c.NODES, [])
+                )
+                if nodes:
+                    for key, value in nodes[0].items():
+                        if value is not None:
+                            merged[key] = value
+            except Exception as e:
+                logger.warning(
+                    f"Split sub-query failed for {connection_type} branch '{branch}': {e}"
+                )
+                continue
+
+        return merged if merged else None
+
+    def get_connection_object_page(  # noqa: C901
         self,
         query: str,
         connection_type: str,
@@ -1736,6 +1859,34 @@ class TableauSiteSource:
                     self.report.warning(
                         message=f"Received error fetching Query Connection {connection_type}",
                         context=f"Errors: {other_errors}",
+                    )
+
+                # Check for null field errors caused by node limit truncation
+                null_field_errors = [
+                    e
+                    for e in errors
+                    if (e.get(c.EXTENSIONS) or {}).get("classification")
+                    == "NullValueInNonNullableField"
+                ]
+                if null_field_errors and node_limit_errors:
+                    recovery_result = self._handle_node_limit_with_null_fields(
+                        query=query,
+                        connection_type=connection_type,
+                        query_filter=query_filter,
+                        query_data=query_data,
+                        fetch_size=fetch_size,
+                        current_cursor=current_cursor,
+                        retry_on_auth_error=retry_on_auth_error,
+                        retries_remaining=retries_remaining,
+                        null_field_errors=null_field_errors,
+                    )
+                    if recovery_result is not None:
+                        return recovery_result
+                elif null_field_errors:
+                    logger.warning(
+                        f"Tableau API returned null for non-nullable fields in {connection_type}. "
+                        f"Partial results will be used. "
+                        f"Affected paths: {[e.get('path') for e in null_field_errors]}"
                     )
 
                 if permission_mode_errors:
