@@ -1124,7 +1124,10 @@ def query_metadata_cursor_based_pagination(
     first: int,
     after: Optional[str],
     qry_filter: str = "",
+    total_timeout_seconds: int = 180,
 ) -> dict:
+    import threading
+
     query = f"""
         query GetItems(
           $first: Int,
@@ -1145,15 +1148,68 @@ def query_metadata_cursor_based_pagination(
             }}
     }}"""  # {{ is to escape { character of f-string
 
-    result = server.metadata.query(
-        query=query,
-        variables={
-            "first": first,
-            "after": after,
-        },
-    )
+    timed_out = threading.Event()
+    session = getattr(server, "_session", None)
 
-    return result
+    def _close_session_on_timeout() -> None:
+        timed_out.set()
+        if session is not None:
+            try:
+                session.close()
+            except Exception:
+                pass
+
+    timer = threading.Timer(total_timeout_seconds, _close_session_on_timeout)
+    timer.daemon = True
+    timer.start()
+
+    try:
+        result = server.metadata.query(
+            query=query,
+            variables={
+                "first": first,
+                "after": after,
+            },
+        )
+        timer.cancel()
+        return result
+    except Exception as e:
+        timer.cancel()
+        if timed_out.is_set():
+            # Session was forcibly closed — recreate it for subsequent retries.
+            _recreate_session(server, session)
+            raise RuntimeError(
+                f"Metadata API request timed out after {total_timeout_seconds}s "
+                f"(connection={connection_name}, first={first}, after={after!r})"
+            ) from e
+        raise
+
+
+def _recreate_session(server: Any, old_session: Any) -> None:
+    """Replace the server's HTTP session after a forced close."""
+    if old_session is None:
+        return
+    try:
+        import requests as _requests
+        from requests.adapters import HTTPAdapter as _HTTPAdapter
+        from urllib3 import Retry as _Retry
+
+        new_session = _requests.Session()
+        new_session.verify = old_session.verify
+        new_session.trust_env = old_session.trust_env
+        new_session.headers.update(old_session.headers)
+        adapter = _HTTPAdapter(
+            max_retries=_Retry(
+                total=3,
+                backoff_factor=1,
+                status_forcelist=[429, 500, 502, 503, 504],
+            )
+        )
+        new_session.mount("http://", adapter)
+        new_session.mount("https://", adapter)
+        server._session = new_session
+    except Exception as exc:
+        logger.warning(f"Failed to recreate session after timeout: {exc}")
 
 
 def get_filter_pages(query_filter: dict, page_size: int) -> List[dict]:
